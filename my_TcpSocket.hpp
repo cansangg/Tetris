@@ -13,15 +13,21 @@
 #include <functional>
 #include <netinet/tcp.h>
 
-// size_t: 3
-// fd_kernel_buffer: {'U', 'R', EOF} 
+// size_t: 2
+// fd_kernel_buffer: {'U', 'R', (EOF_FLAG/RST_FLAG <- notrealdata)} 
+
+/*核心接口：
+    堵塞式: connectTo()
+    非堵塞式: bindAndListen(), setBlocking(), setHandleEvent(), setHandleWrite(), getFd(),
+        两态acceptClient()，三态readExactly()/readUntil()
+*/
 
 namespace my {
     class TcpSocket { 
     private:
         int fd;
         std::string in_buffer;
-        bool private_is_closed = false;
+        std::string out_buffer;
 
         explicit TcpSocket(int client_fd) : fd(client_fd) {
             int opt = 1;
@@ -29,27 +35,22 @@ namespace my {
             setBlocking(false); //默认非堵塞防半包时readExactly堵很久
         }
 
-        bool recv_to_buffer() {
-            if (fd < 0 || private_is_closed) return false;
+        ssize_t recv_to_buffer() { // 大于0 : 成功吸入的字节数 0 : 连接关闭 (正常EOF/异常RST) -1 : 暂无数据 (EAGAIN)
+            if (fd < 0) return 0;
             char tmp_buf[4096];
-            int bytes_read = ::read(fd, tmp_buf, sizeof(tmp_buf));
+            ssize_t bytes_read = ::read(fd, tmp_buf, sizeof(tmp_buf));
             
             if (bytes_read > 0) {
-                // 【情况1：健康】成功拿到数据
                 in_buffer.append(tmp_buf, bytes_read);
-                return true;
+                return bytes_read; //读到数据
             } else if (bytes_read == 0) {
-                // 【情况2：和平分手】收到对端的 FIN 包 (EOF)
-                private_is_closed = true;
-                return false;
-            } else /*if (bytes_read < 0)*/ {
+                return 0; // 正常EOF
+            } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // **【情况3：暂无数据】这是非阻塞才有的正常现象，连接没死！**
-                    return false; 
+                    return -1; // 暂无数据
                 }
-                // 【情况4：意外暴毙】比如收到 RST 重置包
-                private_is_closed = true;
-                return false;
+                // 异常RST (用户直接拔网线/杀进程了)
+                return 0; 
             }
         }
 
@@ -58,11 +59,14 @@ namespace my {
                 ::close(fd);
                 fd = -1;
                 in_buffer.clear();
+                out_buffer.clear();
             }
         }
 
     public:
+        bool write_waiting = false; //避免频繁系统调用
         std::function<void(my::TcpSocket*)> handle_event;
+        std::function<void(my::TcpSocket*)> handle_write;
 
     public:
         TcpSocket() {
@@ -84,12 +88,13 @@ namespace my {
         // 1. 补全移动构造函数
         TcpSocket(TcpSocket&& other) noexcept : 
             fd(other.fd), 
+            write_waiting(other.write_waiting),
             in_buffer(std::move(other.in_buffer)),
+            out_buffer(std::move(other.out_buffer)),
             handle_event(std::move(other.handle_event)),
-            private_is_closed(other.private_is_closed)
+            handle_write(std::move(other.handle_write))
         {
             other.fd = -1;
-            other.private_is_closed = true;
         }
 
         // 2. 补全移动赋值运算符
@@ -97,11 +102,12 @@ namespace my {
             if (this != &other) {
                 close();
                 fd = other.fd;
+                write_waiting = other.write_waiting;
                 in_buffer = std::move(other.in_buffer);
+                out_buffer = std::move(other.out_buffer);
                 handle_event = std::move(other.handle_event);
-                private_is_closed = other.private_is_closed;
+                handle_write = std::move(other.handle_write);
                 other.fd = -1;
-                other.private_is_closed = true;
             }
             return *this;
         }
@@ -120,7 +126,7 @@ namespace my {
             if (flags == -1) throw std::runtime_error("fcntl 获取状态失败");
             bool is_originally_blocking = (flags & O_NONBLOCK) == 0;
 
-            setBlocking(true); 
+            setBlocking(true); //拨号逻辑上应堵塞
             
             int connect_err = 0;
             if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -147,8 +153,8 @@ namespace my {
                 throw std::runtime_error("Listen 失败!");
         }
 
-
         //std::nullopt: 非堵塞读取,暂无数据
+        //LISTEN 状态, 无关闭连接语义
         //std::optional<TcpSocket{}>：读到数据
         std::optional<TcpSocket> acceptClient() {
             struct sockaddr_in client_addr;
@@ -164,10 +170,6 @@ namespace my {
                 if (errno == ECONNABORTED) {
                     return std::nullopt;
                 }
-                // 【常态 3】：系统调用被底层的某些信号打断了
-                if (errno == EINTR) {
-                    return std::nullopt;
-                }
 
                 throw std::runtime_error(std::string("Accept 遭遇错误: ") + strerror(errno));
             }
@@ -175,15 +177,14 @@ namespace my {
             return TcpSocket(client_fd); // 自动包装成 optional 成功态
         }
 
-        //std::nullopt: 关闭连接
-        //std::optional<"">：非堵塞读取,暂无数据
+        //std::nullopt: 非堵塞读取,暂无数据
+        //std::optional<"">：关闭连接
         //std::optional<"LRU">：读到数据
         std::optional<std::string> readExactly(size_t length) {
             while (in_buffer.length() < length) {
-                if (!recv_to_buffer()) {
-                    if (private_is_closed) return std::nullopt;
-                    else return ""; 
-                }
+                ssize_t res = recv_to_buffer();
+                if (res == 0) return "";
+                if (res == -1) return std::nullopt;
             }
             std::string result = in_buffer.substr(0, length);
             in_buffer.erase(0, length);
@@ -200,23 +201,37 @@ namespace my {
                     in_buffer.erase(0, extract_len); 
                     return result;
                 }
-                if (!recv_to_buffer()) {
-                    if (private_is_closed) return std::nullopt;
-                    else return ""; 
-                }
+                ssize_t res = recv_to_buffer();
+                if (res == 0) return "";
+                if (res == -1) return std::nullopt;
             }
         }
 
-        bool write(const std::string& msg) {
-            if (fd < 0) return false;
-            ssize_t sent = ::send(fd, msg.c_str(), msg.length(), MSG_NOSIGNAL);
-            return sent == (ssize_t)msg.length();
+        void write(const std::string& msg) {
+            if (fd < 0 || msg.empty()) return;
+            out_buffer += msg;
+            if (handle_write) handle_write(this);
+            return;
+        }
+
+        //1: 发完了 0: 没发完 -1: 连接断开
+        ssize_t send_to_kernel() {
+            ssize_t sent = ::send(fd, out_buffer.c_str(), out_buffer.length(), MSG_NOSIGNAL);
+            if (sent > 0) { //发了一部分
+                out_buffer.erase(0, sent);
+                return out_buffer.empty();
+            } else /*if (sent < 0)*/ {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return 0; //只是内核满了
+                }
+                return -1; // 遭遇RST, poller响后在client->handle_event()里处理断开连接
+            }
         }
 
         int getFd() const { return fd; }
 
-        void setBlocking(bool blocking) { //设置::read(this->fd)时非堵塞
-            if (fd < 0 || private_is_closed) return;
+        void setBlocking(bool blocking) { //设置::read(this->fd)/::accept(this->fd)时非堵塞
+            if (fd < 0) return;
             int flags = fcntl(fd, F_GETFL, 0);
             if (flags == -1) throw std::runtime_error("fcntl F_GETFL 失败");
 
@@ -235,26 +250,30 @@ namespace my {
             handle_event = std::move(_handle_event);
         };
 
-        static size_t getBodyLength(const std::string& header) {
-            size_t pos = header.find("Content-Length:");
-            if (pos == std::string::npos) pos = header.find("content-length:");
+        void setHandleWrite(std::function<void(my::TcpSocket*)> _handle_write) {
+            handle_write = std::move(_handle_write);
+        };
+    };
 
-            if (pos != std::string::npos) {
-                pos += 15; 
-                size_t end_pos = header.find("\r\n", pos);
-                
-                if (end_pos != std::string::npos) {
-                    try {
-                        std::string num_str = header.substr(pos, end_pos - pos);
-                        return std::stoull(num_str);
-                    } catch (const std::exception&) {
-                        return 0;
-                    }
+    size_t getBodyLength(const std::string& header) {
+        size_t pos = header.find("Content-Length:");
+        if (pos == std::string::npos) pos = header.find("content-length:");
+
+        if (pos != std::string::npos) {
+            pos += 15; 
+            size_t end_pos = header.find("\r\n", pos);
+            
+            if (end_pos != std::string::npos) {
+                try {
+                    std::string num_str = header.substr(pos, end_pos - pos);
+                    return std::stoull(num_str);
+                } catch (const std::exception&) {
+                    return 0;
                 }
             }
-            return 0; 
         }
-    };
+        return 0; 
+    }
 }
 
 // 值传递 = 必须在函数内部构造一个新对象。至于怎么构造？既可以是拷贝构造，也可以是移动构造
